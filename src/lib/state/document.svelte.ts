@@ -7,27 +7,39 @@ type Send = (page: string, seq: number, text: string, fresh: boolean) => Promise
 
 const debounceMs = 150;
 
-const starterText = `= Welcome to znote
-
-Type Typst on the left. The pages on the right update as you type.
-
-- *Bold*, _emphasis_ and \`code\`
-- Maths: $ sum_(k=1)^n k = (n(n+1)) / 2 $
-`;
-
 export class Document {
-  readonly page = "scratch";
-  text = $state(starterText);
+  text = $state("");
   pages = $state<PageView[]>([]);
   diagnostics = $state<Diagnostic[]>([]);
   downloading = $state<string | null>(null);
   failure = $state<string | null>(null);
+  loading = $state(false);
+  opened = $state(0);
 
   private sent = 0;
   private applied = 0;
+  private fresh = true;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor(private send: Send) {}
+  constructor(
+    private send: Send,
+    public page = "",
+  ) {}
+
+  open(page: string, text: string) {
+    clearTimeout(this.timer);
+    this.pages.forEach((shown) => URL.revokeObjectURL(shown.url));
+    this.page = page;
+    this.text = text;
+    this.pages = [];
+    this.diagnostics = [];
+    this.failure = null;
+    this.applied = this.sent;
+    this.fresh = true;
+    this.opened += 1;
+    this.loading = false;
+    if (page) this.request();
+  }
 
   edit(text: string) {
     this.text = text;
@@ -35,12 +47,20 @@ export class Document {
     this.timer = setTimeout(() => this.request(), debounceMs);
   }
 
+  refresh() {
+    clearTimeout(this.timer);
+    this.fresh = true;
+    if (this.page) this.request();
+  }
+
   request() {
     this.sent += 1;
-    this.send(this.page, this.sent, this.text, this.applied === 0).catch((error: unknown) => this.fail(String(error)));
+    this.loading = true;
+    this.send(this.page, this.sent, this.text, this.fresh).catch((error: unknown) => this.fail(String(error)));
   }
 
   fail(message: string) {
+    this.loading = false;
     this.downloading = null;
     this.failure = message;
   }
@@ -48,6 +68,8 @@ export class Document {
   receive(result: Compiled) {
     if (result.page !== this.page || result.seq <= this.applied) return;
     this.applied = result.seq;
+    this.fresh = false;
+    this.loading = result.seq !== this.sent;
     this.downloading = null;
     this.failure = null;
 
@@ -74,9 +96,7 @@ export function connect() {
     onCompiled((result) => doc.receive(result)),
     onDownloading((packageName) => (doc.downloading = packageName)),
     onCompileFailed((message) => doc.fail(message)),
-  ])
-    .then(() => doc.request())
-    .catch((error: unknown) => doc.fail(String(error)));
+  ]).catch((error: unknown) => doc.fail(String(error)));
 }
 
 if (import.meta.vitest) {
@@ -99,7 +119,7 @@ if (import.meta.vitest) {
 
   test("typing sends one request with the latest text after the pause", () => {
     const send = vi.fn<Send>(() => Promise.resolve());
-    const doc = new Document(send);
+    const doc = new Document(send, "scratch");
     doc.edit("a");
     doc.edit("ab");
     vi.advanceTimersByTime(debounceMs - 1);
@@ -113,10 +133,11 @@ if (import.meta.vitest) {
   });
 
   test("an older result never replaces a newer one", () => {
-    const doc = new Document(() => Promise.resolve());
+    const doc = new Document(() => Promise.resolve(), "scratch");
     doc.request();
     doc.request();
     doc.receive(result(2, { pageCount: 2, pages: [rendered(0), rendered(1)] }));
+    expect(doc.loading).toBe(false);
     const newest = doc.pages.map((page) => page.url);
     doc.receive(result(1, { diagnostics: [problem] }));
     expect(doc.pages.map((page) => page.url)).toEqual(newest);
@@ -124,10 +145,11 @@ if (import.meta.vitest) {
   });
 
   test("problems from a result that is already out of date are not shown", () => {
-    const doc = new Document(() => Promise.resolve());
+    const doc = new Document(() => Promise.resolve(), "scratch");
     doc.request();
     doc.request();
     doc.receive(result(1, { diagnostics: [problem] }));
+    expect(doc.loading).toBe(true);
     expect(doc.pages).toHaveLength(1);
     expect(doc.diagnostics).toEqual([]);
     doc.receive(result(2, { pages: [], diagnostics: [problem] }));
@@ -135,7 +157,7 @@ if (import.meta.vitest) {
   });
 
   test("a failed compile keeps the last good pages and only changed pages are swapped", () => {
-    const doc = new Document(() => Promise.resolve());
+    const doc = new Document(() => Promise.resolve(), "scratch");
     doc.request();
     doc.receive(result(1, { pageCount: 2, pages: [rendered(0), rendered(1)] }));
     const [first, second] = doc.pages.map((page) => page.url);
@@ -149,5 +171,22 @@ if (import.meta.vitest) {
     doc.request();
     doc.receive(result(4, { pageCount: 1, pages: [] }));
     expect(doc.pages).toHaveLength(1);
+  });
+
+  test("opening another page starts clean and ignores what the last page still had coming", () => {
+    const send = vi.fn<Send>(() => Promise.resolve());
+    const doc = new Document(send, "scratch");
+    doc.request();
+    doc.receive(result(1));
+    doc.request();
+    doc.open("other", "text");
+    expect(doc.pages).toEqual([]);
+    expect(send.mock.lastCall).toEqual(["other", 3, "text", true]);
+    doc.receive(result(2, { page: "other" }));
+    expect(doc.pages).toEqual([]);
+    doc.receive(result(3, { page: "other" }));
+    expect(doc.pages).toHaveLength(1);
+    doc.open("", "");
+    expect(send).toHaveBeenCalledTimes(3);
   });
 }

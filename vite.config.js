@@ -18,6 +18,9 @@ export default defineConfig(() => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
+  // The bundle is loaded from disk by the webview, not over a network, and the editor
+  // (CodeMirror) is on screen at startup, so splitting the page chunk buys nothing.
+  build: { chunkSizeWarningLimit: 1000 },
   // 2. tauri expects a fixed port; `beforeDevCommand` passes `--port 1420 --strictPort`,
   //    so plain `pnpm dev` keeps the Vite default (5173)
   server: {

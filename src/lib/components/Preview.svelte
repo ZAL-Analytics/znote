@@ -1,15 +1,23 @@
 <script lang="ts">
+  import { untrack } from "svelte";
+  import LoaderCircle from "@lucide/svelte/icons/loader-circle";
   import Minus from "@lucide/svelte/icons/minus";
   import Plus from "@lucide/svelte/icons/plus";
+  import RefreshCw from "@lucide/svelte/icons/refresh-cw";
   import { Button } from "$lib/components/ui/button";
   import type { PageView } from "$lib/state/document.svelte";
 
-  let { pages }: { pages: PageView[] } = $props();
+  let {
+    pages,
+    startZoom,
+    loading,
+    onrefresh,
+  }: { pages: PageView[]; startZoom: number | null; loading: boolean; onrefresh: () => void } = $props();
 
   const cssPixelsPerPoint = 96 / 72;
   const step = 1.25;
 
-  let zoom = $state<number | null>(null);
+  let zoom = $state(untrack(() => startZoom));
 
   const zoomLabel = $derived(zoom === null ? "Fit" : `${Math.round(zoom * 100)}%`);
 
@@ -19,7 +27,13 @@
 </script>
 
 <div class="flex h-full flex-col">
-  <div class="flex h-9 shrink-0 items-center justify-end gap-1 border-b px-2 text-xs text-muted-foreground">
+  <div class="flex h-9 shrink-0 items-center gap-1 border-b px-2 text-xs text-muted-foreground">
+    <Button variant="ghost" size="icon-xs" aria-label="Refresh the preview" title="Refresh the preview" onclick={onrefresh}>
+      <RefreshCw />
+    </Button>
+    <span class="flex flex-1 items-center gap-1" role="status">
+      {#if loading}<LoaderCircle class="size-3.5 animate-spin" /> Updating…{/if}
+    </span>
     <span class="mr-1 tabular-nums" aria-live="polite">{zoomLabel}</span>
     <Button variant="ghost" size="icon-xs" aria-label="Zoom out" title="Zoom out" onclick={() => scale(1 / step)}>
       <Minus />

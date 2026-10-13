@@ -11,3 +11,6 @@ znote also brings Claude directly into your writing workflow. Connect your Claud
 - Claude chat to generate and edit Typst files conversationally
 - Native, fast, and small, powered by Tauri
 - Works with your local files
+
+**Documentation**
+- [The `.znote-theme` format](docs/znote-theme.md): how to build a theme file with UI colours, logos, fonts and Typst templates

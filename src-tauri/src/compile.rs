@@ -1,12 +1,12 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-use typst::diag::{FileError, FileResult, Severity, SourceDiagnostic};
+use typst::diag::{FileResult, PackageError, Severity, SourceDiagnostic, SourceResult, Warned};
 use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
@@ -15,20 +15,24 @@ use typst::utils::{LazyHash, hash128};
 use typst::{Library, LibraryExt, World, WorldExt};
 use typst_kit::datetime::Time;
 use typst_kit::downloader::{Downloader, SystemDownloader};
-use typst_kit::files::{FileLoader, FileStore};
+use typst_kit::files::{FileLoader, FileStore, FsRoot};
 use typst_kit::fonts::{self, FontStore};
 use typst_kit::packages::SystemPackages;
 use typst_layout::PagedDocument;
 use typst_svg::SvgOptions;
 
+use crate::theme;
+use crate::workspace::Workspace;
+
 static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Library::default()));
 
-static FONTS: LazyLock<FontStore> = LazyLock::new(|| {
+pub fn font_store(themes: &Path) -> FontStore {
     let mut store = FontStore::new();
     store.extend(fonts::system());
     store.extend(fonts::embedded());
+    store.extend(fonts::scan(themes));
     store
-});
+}
 
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +86,8 @@ impl<F: Fn(&str) + Send + Sync + 'static> Downloader for Announcing<F> {
 struct Loader {
     main: FileId,
     text: String,
+    project: FsRoot,
+    themes: PathBuf,
     packages: SystemPackages,
 }
 
@@ -91,8 +97,15 @@ impl FileLoader for Loader {
             return Ok(Bytes::from_string(self.text.clone()));
         }
         match id.root() {
+            VirtualRoot::Package(spec) if spec.namespace == "themes" => {
+                let package = self.themes.join(spec.name.as_str()).join(spec.version.to_string()).join("typst");
+                if !theme::valid_id(&spec.name) || !package.is_dir() {
+                    return Err(PackageError::NotFound(spec.clone()).into());
+                }
+                FsRoot::new(package).load(id.vpath())
+            }
             VirtualRoot::Package(spec) => self.packages.obtain(spec)?.load(id.vpath()),
-            VirtualRoot::Project => Err(FileError::NotFound(PathBuf::from(id.vpath().get_without_slash()))),
+            VirtualRoot::Project => self.project.load(id.vpath()),
         }
     }
 }
@@ -100,6 +113,7 @@ impl FileLoader for Loader {
 pub struct PageWorld {
     main: FileId,
     files: FileStore<Loader>,
+    fonts: Arc<FontStore>,
     time: Time,
     hashes: Vec<u128>,
 }
@@ -110,7 +124,7 @@ impl World for PageWorld {
     }
 
     fn book(&self) -> &LazyHash<FontBook> {
-        FONTS.book()
+        self.fonts.book()
     }
 
     fn main(&self) -> FileId {
@@ -126,7 +140,7 @@ impl World for PageWorld {
     }
 
     fn font(&self, index: usize) -> Option<Font> {
-        FONTS.font(index)
+        self.fonts.font(index)
     }
 
     fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
@@ -135,28 +149,48 @@ impl World for PageWorld {
 }
 
 impl PageWorld {
-    pub fn new(announce_download: impl Fn(&str) + Send + Sync + 'static) -> Result<Self, String> {
-        let path = VirtualPath::new("main.typ").map_err(|error| error.to_string())?;
+    pub fn new(
+        project: &Path,
+        main: &str,
+        themes: &Path,
+        fonts: Arc<FontStore>,
+        announce_download: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let path = VirtualPath::new(main).map_err(|error| error.to_string())?;
         let main = FileId::unique(RootedPath::new(VirtualRoot::Project, path));
         let downloader = Announcing {
             inner: SystemDownloader::new(concat!("znote/", env!("CARGO_PKG_VERSION"))),
             announce: announce_download,
         };
-        let loader = Loader { main, text: String::new(), packages: SystemPackages::new(downloader) };
-        Ok(Self { main, files: FileStore::new(loader), time: Time::system(), hashes: Vec::new() })
+        let loader = Loader {
+            main,
+            text: String::new(),
+            project: FsRoot::new(project.to_path_buf()),
+            themes: themes.to_path_buf(),
+            packages: SystemPackages::new(downloader),
+        };
+        Ok(Self { main, files: FileStore::new(loader), fonts, time: Time::system(), hashes: Vec::new() })
     }
 
     pub fn forget_sent_pages(&mut self) {
         self.hashes.clear();
     }
 
-    pub fn compile(&mut self, text: String) -> Compiled {
+    fn typeset(&mut self, text: String) -> Warned<SourceResult<PagedDocument>> {
         self.files.loader_mut().text = text;
         self.files.reset();
         self.time.reset();
+        typst::compile::<PagedDocument>(self)
+    }
 
-        let warned = typst::compile::<PagedDocument>(self);
-        let mut diagnostics: Vec<Diagnostic> = warned.warnings.iter().map(|d| self.diagnostic(d)).collect();
+    pub fn document(&mut self, text: String) -> Result<PagedDocument, String> {
+        self.typeset(text).output.map_err(|_| "Fix the problems on this page before you export it.".to_string())
+    }
+
+    pub fn compile(&mut self, text: String) -> Compiled {
+        let warned = self.typeset(text);
+        let mut diagnostics: Vec<Diagnostic> =
+            warned.warnings.iter().filter(|d| !self.template_font_fallback(d)).map(|d| self.diagnostic(d)).collect();
 
         let document = match warned.output {
             Ok(document) => document,
@@ -181,6 +215,10 @@ impl PageWorld {
             .collect();
         self.hashes = hashes;
         Compiled { page_count: Some(self.hashes.len()), pages, diagnostics }
+    }
+
+    fn template_font_fallback(&self, diagnostic: &SourceDiagnostic) -> bool {
+        diagnostic.span.id() != Some(self.main) && diagnostic.message.starts_with("unknown font family")
     }
 
     fn diagnostic(&self, diagnostic: &SourceDiagnostic) -> Diagnostic {
@@ -215,24 +253,55 @@ impl PageWorld {
 #[derive(Default)]
 pub struct Compiler {
     latest: Mutex<HashMap<String, u64>>,
-    worlds: Mutex<HashMap<String, PageWorld>>,
+    world: Mutex<Option<(PathBuf, PageWorld)>>,
+    fonts: Mutex<Option<Arc<FontStore>>>,
+}
+
+impl Compiler {
+    pub fn forget_themes(&self) -> Result<(), String> {
+        *self.world.lock().map_err(|error| error.to_string())? = None;
+        *self.fonts.lock().map_err(|error| error.to_string())? = None;
+        Ok(())
+    }
+}
+
+type OpenWorld = Option<(PathBuf, PageWorld)>;
+
+fn open_world<'a>(app: &AppHandle, open: &'a mut OpenWorld, page: &str) -> Result<&'a mut PageWorld, String> {
+    let (project, main) = app.state::<Workspace>().typst_source(page)?;
+    let file = project.join(&main);
+    if open.as_ref().is_none_or(|(current, _)| *current != file) {
+        let announcer = app.clone();
+        let themes = theme::folder(app)?;
+        let fonts = app
+            .state::<Compiler>()
+            .fonts
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get_or_insert_with(|| Arc::new(font_store(&themes)))
+            .clone();
+        let world = PageWorld::new(&project, &main, &themes, fonts, move |package| {
+            let _ = announcer.emit("downloading", package);
+        })?;
+        *open = Some((file, world));
+    }
+    open.as_mut().map(|(_, world)| world).ok_or_else(|| "The page could not be opened.".to_string())
+}
+
+pub fn document(app: &AppHandle, page: &str, text: String) -> Result<PagedDocument, String> {
+    let compiler = app.state::<Compiler>();
+    let mut open = compiler.world.lock().map_err(|error| error.to_string())?;
+    open_world(app, &mut open, page)?.document(text)
 }
 
 fn compile_page(app: &AppHandle, page: &str, seq: u64, text: String, fresh: bool) -> Result<(), String> {
     let compiler = app.state::<Compiler>();
-    let mut worlds = compiler.worlds.lock().map_err(|error| error.to_string())?;
+    let mut open = compiler.world.lock().map_err(|error| error.to_string())?;
     let superseded = compiler.latest.lock().map_err(|error| error.to_string())?.get(page) != Some(&seq);
     if superseded {
         return Ok(());
     }
-    if !worlds.contains_key(page) {
-        let announcer = app.clone();
-        let world = PageWorld::new(move |package| {
-            let _ = announcer.emit("downloading", package);
-        })?;
-        worlds.insert(page.to_string(), world);
-    }
-    let world = worlds.get_mut(page).ok_or("The page could not be opened.")?;
+    let world = open_world(app, &mut open, page)?;
     if fresh {
         world.forget_sent_pages();
     }
@@ -262,8 +331,56 @@ pub fn compile(
 mod tests {
     use super::*;
 
+    static FONTS: LazyLock<Arc<FontStore>> =
+        LazyLock::new(|| Arc::new(font_store(Path::new(env!("CARGO_MANIFEST_DIR")).join("no-themes").as_path())));
+
     fn world() -> PageWorld {
-        PageWorld::new(|_| {}).unwrap()
+        let folder = std::env::temp_dir();
+        PageWorld::new(&folder, "main.typ", &folder.join("no-themes"), FONTS.clone(), |_| {}).unwrap()
+    }
+
+    #[test]
+    fn a_theme_package_is_read_from_the_themes_folder_with_its_fonts() {
+        let themes = std::env::temp_dir().join(format!("znote-compile-themes-{}", std::process::id()));
+        let package = themes.join("acme").join("0.1.0").join("typst");
+        std::fs::create_dir_all(package.join("fonts")).unwrap();
+        std::fs::write(package.join("typst.toml"), "[package]\nname = \"acme\"\nversion = \"0.1.0\"\nentrypoint = \"lib.typ\"\n")
+            .unwrap();
+        std::fs::write(package.join("lib.typ"), "#let brand = text(font: (\"Not Shipped\", \"Libertinus Serif\"))[Acme]").unwrap();
+        let font = fonts::embedded().next().unwrap().0;
+        std::fs::write(package.join("fonts").join("copy.ttf"), font.data()).unwrap();
+
+        let fonts = Arc::new(font_store(&themes));
+        assert!(FONTS.book().families().count() > 0);
+        assert!(fonts.source(FONTS.book().families().map(|(_, infos)| infos.count()).sum::<usize>()).is_some());
+
+        let mut world = PageWorld::new(&std::env::temp_dir(), "main.typ", &themes, fonts, |_| {}).unwrap();
+        let result = world.compile("#import \"@themes/acme:0.1.0\": brand\n#brand".into());
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.page_count, Some(1));
+
+        let own = world.compile("#set text(font: \"Not Shipped\")\nHello".into());
+        assert!(own.diagnostics[0].message.contains("unknown font family"), "{:?}", own.diagnostics);
+
+        let missing = world.compile("#import \"@themes/other:0.1.0\": brand".into());
+        assert_eq!(missing.page_count, None);
+        assert!(missing.diagnostics[0].message.contains("package not found"), "{:?}", missing.diagnostics);
+    }
+
+    #[test]
+    fn a_page_reads_other_files_from_its_project_folder() {
+        let project = std::env::temp_dir().join(format!("znote-compile-{}", std::process::id()));
+        std::fs::create_dir_all(project.join("Notes")).unwrap();
+        std::fs::write(project.join("shared.typ"), "#let greeting = [Hello]").unwrap();
+        let mut world =
+            PageWorld::new(&project, "Notes/Page.typ", &project.join("no-themes"), FONTS.clone(), |_| {}).unwrap();
+
+        let result = world.compile("#import \"../shared.typ\": greeting\n#greeting".into());
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.page_count, Some(1));
+
+        let escaping = world.compile("#read(\"../../outside.txt\")".into());
+        assert_eq!(escaping.page_count, None);
     }
 
     #[test]

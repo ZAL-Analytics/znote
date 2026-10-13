@@ -18,6 +18,7 @@ vite.config.ts.timestamp-*
 /.serena
 /.zed
 /.claude
+/.metadata_cache
 AGENTS.md
 GUIDELINES.md
 

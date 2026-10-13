@@ -3,6 +3,7 @@
   import { minimalSetup } from "codemirror";
   import { HighlightStyle, LanguageSupport, syntaxHighlighting } from "@codemirror/language";
   import { setDiagnostics } from "@codemirror/lint";
+  import { Compartment } from "@codemirror/state";
   import { EditorView, lineNumbers } from "@codemirror/view";
   import { tags } from "@lezer/highlight";
   import { typst_lezer } from "codemirror-lang-typst/lezer";
@@ -11,11 +12,21 @@
   let {
     text,
     diagnostics,
+    fontSize,
+    wordWrap,
     onchange,
-  }: { text: string; diagnostics: Diagnostic[]; onchange: (text: string) => void } = $props();
+  }: {
+    text: string;
+    diagnostics: Diagnostic[];
+    fontSize: number;
+    wordWrap: boolean;
+    onchange: (text: string) => void;
+  } = $props();
 
   let host: HTMLDivElement;
   let view: EditorView | undefined;
+
+  const look = new Compartment();
 
   const colours = EditorView.theme({
     "&": { height: "100%", color: "var(--foreground)", backgroundColor: "var(--background)" },
@@ -70,7 +81,7 @@
       extensions: [
         minimalSetup,
         lineNumbers(),
-        EditorView.lineWrapping,
+        look.of([]),
         new LanguageSupport(typst_lezer().language),
         syntaxHighlighting(highlighting),
         colours,
@@ -82,6 +93,15 @@
     });
     view = created;
     return () => created.destroy();
+  });
+
+  $effect(() => {
+    view?.dispatch({
+      effects: look.reconfigure([
+        wordWrap ? EditorView.lineWrapping : [],
+        EditorView.theme({ "&": { fontSize: `${fontSize}px` } }),
+      ]),
+    });
   });
 
   $effect(() => {
@@ -101,4 +121,4 @@
   });
 </script>
 
-<div bind:this={host} class="h-full overflow-hidden text-sm"></div>
+<div bind:this={host} class="h-full overflow-hidden"></div>
