@@ -13,7 +13,7 @@
     "test": "vitest run",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build --debug --no-bundle",
+    "tauri:build": "tauri build --no-bundle",
     "tauri:run": "./src-tauri/target/debug/znote"
   },
   "license": "Apache-2.0",
